@@ -1,0 +1,7 @@
+#!/bin/bash
+rm $2
+nohup python $1 1 >  $2 &
+nohup python $1 2 >> $2 &
+nohup python $1 3 >> $2 &
+nohup python $1 4 >> $2 &
+python $1 5
