@@ -2,6 +2,8 @@
 Created in Sep, 2021, this github version in Jan 2022.
 @author: Slawek Smyl
 internal version no: 72, for the new test set (with nulls)
+not resetting gradient of per series trainers bug fix in Dec 2022
+
 
 The program is meant to save forecasts to a database. Table creation, query and export scripts are listed at the end of this file.
 If using ODBC, you also need to create DSN=slawek
@@ -60,9 +62,11 @@ else:
 from typing import List, Tuple, Optional  
 import random
 import datetime as dt
+import pickle
 import numpy as np
 import pandas as pd
 import sys
+import warnings
 pd.set_option('display.max_rows',50_000)
 pd.set_option('display.max_columns', 400)
 pd.set_option('display.width',200)
@@ -88,7 +92,7 @@ DEBUG_AUTOGRAD_ANOMALIES=False
 torch.autograd.set_detect_anomaly(DEBUG_AUTOGRAD_ANOMALIES)
 
 #    72 S3[2],S3[4],S2[7] [0.48,0.035,0.96] LR=3e-3 {5,/3, 6,/10, 7/30} batch=2 {4:5}
-RUN='72 S3[2],S2[4],S2[7] [0.485,0.035,0.96] LR=3e-3 {5,/3, 6,/10, 7/30} batch=2 {4:5}'
+RUN='72f PER_SERIES_MULTIP=10 S3[2],S2[4],S2[7] [0.485,0.035,0.96] LR=3e-3 {5,/3, 6,/10, 7/30} batch=2 {4:5}'
 RUN_SHORT="72" #this will be the subdirectory where to save forecasts if USE_DB==False
 
 NUM_OF_EPOCHS=9
@@ -107,6 +111,7 @@ SAVE_TEST_EVERY_STEP=1
 PI_WEIGHT=0.3
 INITIAL_LEARNING_RATE=3e-3
 NUM_OF_TRAINING_STEPS=50
+PER_SERIES_MULTIP=10
 
 STEP_SIZE=24
 SEASONALITY_IN_DAYS=7
@@ -750,33 +755,35 @@ def validationLossFunc(forec, actuals, maseNormalizer):
   
   #center
   diff=forec[:,0:OUTPUT_WINDOW]-actuals
-  rmse=np.sqrt(np.nanmean(diff*diff, axis=1))
-  mase=np.nanmean(abs(diff), axis=1)/maseNormalizer
-  mape=np.nanmean(abs(diff/actuals), axis=1)
-  bias=np.nanmean(diff/actuals, axis=1)
-  
-  ret[:,0]=rmse
-  ret[:,1]=bias
-  ret[:,2]=mase
-  ret[:,3]=mape
-  
-  #exceedance
-  lower=0; iq=0
-  for iq in range(len(QUANTS)):
-    quant=QUANTS[iq]
-    #print(quant)
-    upper=lower+OUTPUT_WINDOW
-    diff=actuals-forec[:,lower:upper]
+  with warnings.catch_warnings():
+    warnings.simplefilter("ignore", category=RuntimeWarning)
+    rmse=np.sqrt(np.nanmean(diff*diff, axis=1))
+    mase=np.nanmean(abs(diff), axis=1)/maseNormalizer
+    mape=np.nanmean(abs(diff/actuals), axis=1)
+    bias=np.nanmean(diff/actuals, axis=1)
     
-    if quant>=0.5:
-      xceeded=diff>0
-    else:
-      xceeded=diff<0
-        
-    exceeded=np.nanmean(xceeded, axis=1) 
-    ret[:,iq+4]=exceeded
-    lower=upper
+    ret[:,0]=rmse
+    ret[:,1]=bias
+    ret[:,2]=mase
+    ret[:,3]=mape
+    
+    #exceedance
+    lower=0; iq=0
+    for iq in range(len(QUANTS)):
+      quant=QUANTS[iq]
+      #print(quant)
+      upper=lower+OUTPUT_WINDOW
+      diff=actuals-forec[:,lower:upper]
       
+      if quant>=0.5:
+        xceeded=diff>0
+      else:
+        xceeded=diff<0
+          
+      exceeded=np.nanmean(xceeded, axis=1) 
+      ret[:,iq+4]=exceeded
+      lower=upper
+        
   return ret
             
 
@@ -846,7 +853,7 @@ if __name__ == '__main__' or __name__ == 'builtins':
   for series in series_list:
     perSerPars=PerSeriesParams(series)
     perSeriesParams.append(perSerPars)
-    perSerTrainer=torch.optim.Adam(perSerPars.parameters(), lr=INITIAL_LEARNING_RATE)
+    perSerTrainer=torch.optim.Adam(perSerPars.parameters(), lr=INITIAL_LEARNING_RATE*PER_SERIES_MULTIP)
     perSeriesTrainers.append(perSerTrainer)
     
   embed=torch.nn.Linear(DATES_ENCODE_SIZE, DATES_EMBED_SIZE)
@@ -886,7 +893,7 @@ if __name__ == '__main__' or __name__ == 'builtins':
           param_group['lr']=learningRate     
       for series in series_list: 
         for param_group in perSeriesTrainers[series].param_groups:
-          param_group['lr']=learningRate
+          param_group['lr']=learningRate*PER_SERIES_MULTIP
       print('changin LR to:', f'{learningRate:.2}' )   
       
     epochTrainingErrors=[];
@@ -1019,6 +1026,8 @@ if __name__ == '__main__' or __name__ == 'builtins':
         #batch level     
         if len(trainingErrors)>0:
           trainer.zero_grad()  
+          for series in ppBatch.series:
+            perSeriesTrainers[series].zero_grad()
             
           avgTrainLoss_t=torch.mean(torch.cat(trainingErrors))    
           assert not torch.isnan(avgTrainLoss_t)  
@@ -1157,19 +1166,22 @@ if __name__ == '__main__' or __name__ == 'builtins':
                       if oneDate_df is None:
                         oneDate_df=oneRow_df.copy()
                       else:
-                        oneDate_df=oneDate_df.append(oneRow_df.copy())
+                        #oneDate_df=oneDate_df.append(oneRow_df.copy())
+                        oneDate_df=pd.concat([oneDate_df,oneRow_df.copy()])
                               
                   if not USE_DB:        
                     if oneBatch_df is None:
                       oneBatch_df=oneDate_df.copy() #higher loop is through dates, here only one date per series
                     else:
-                      oneBatch_df=oneBatch_df.append(oneDate_df.copy())
+                      #oneBatch_df=oneBatch_df.append(oneDate_df.copy())
+                      oneBatch_df=pd.concat([oneBatch_df,oneDate_df.copy()])
                           
             if not USE_DB and iEpoch>=FIRST_EPOCH_TO_START_SAVING_FORECASTS:    
               if forecast_df is None:
                 forecast_df=oneBatch_df.copy()
               else:
-                forecast_df=forecast_df.append(oneBatch_df.copy())
+                #forecast_df=forecast_df.append(oneBatch_df.copy())
+                forecast_df=pd.concat([forecast_df,oneBatch_df.copy()])
               #print(forecast_df.shape)
                         
         numOfUpdatesSoFar+=1          
@@ -1327,17 +1339,17 @@ query+=")/"+str(OUTPUT_WINDOW)+" as MPE \n"
 
 for ih in range(1,OUTPUT_WINDOW+1):
   if ih==1:
-    query+=",("
+    query+=",sqrt(("
   else:
     query+=" + "
   query+="(predQ50_"+str(ih)+"-actual"+str(ih)+")*(predQ50_"+str(ih)+"-actual"+str(ih)+")" 
-query+=")/"+str(OUTPUT_WINDOW)+" as MSE \n"  
+query+=")/"+str(OUTPUT_WINDOW)+") as RMSE \n"  
 
 query+="from avgValues),"
 #aggregate over forecasts
-query+="perSeries as (select run, series, epoch, count(*) kount, \n\
+query+="\nperSeries as (select run, series, epoch, count(*) kount, \n\
  avg(MAPE) MAPE, avg(MPE) pcBias, \n\
- sqrt(avg(MSE)) RMSE,  \n\
+ avg(RMSE) RMSE,  \n\
  avg(exceed50) exceed50, avg(exceed05) exceed05, avg(exceed95) exceed95,  \n\
  count(distinct forecOriginDate) numForecasts, max(workers) workers \n\
  from perForecMetrics \n\
